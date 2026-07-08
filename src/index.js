@@ -146,9 +146,11 @@ async function createJob(request, env) {
   const lockedKey = `jobs/${jobId}/locked-product.${ext}`;
   const packageKey = `jobs/${jobId}/render-package.json`;
 
-  // Scrub any inline base64 from the stored package. The stored package
-  // references the image by key, so has_image_data is always false at rest.
-  const storedPkg = scrubInlineImageData(pkg, lockedKey, imageMediaType);
+  // Scrub any inline base64 from the stored package and record where the
+  // locked image lives, so the at-rest package references the asset by URL
+  // with has_image_data false.
+  const storedUrl = `${new URL(request.url).origin}/render-jobs/${jobId}/asset/locked`;
+  const storedPkg = scrubInlineImageData(pkg, lockedKey, imageMediaType, storedUrl);
   const now = new Date().toISOString();
 
   // Write assets to R2 first, then the job row. If the row write fails, the
@@ -509,12 +511,13 @@ function extForMedia(m) {
   const map = { 'image/webp': 'webp', 'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg' };
   return map[(m || '').toLowerCase()] || 'webp';
 }
-function scrubInlineImageData(pkg, lockedKey, mediaType) {
+function scrubInlineImageData(pkg, lockedKey, mediaType, storedUrl) {
   const copy = JSON.parse(JSON.stringify(pkg));
   if (copy.locked_asset && typeof copy.locked_asset === 'object') {
     delete copy.locked_asset.image_b64;
     delete copy.locked_asset.image_data;
     copy.locked_asset.storage_key = lockedKey;
+    if (storedUrl) copy.locked_asset.stored_asset_url = storedUrl;
     copy.locked_asset.media_type = copy.locked_asset.media_type || mediaType;
     copy.locked_asset.has_image_data = false;
   }
