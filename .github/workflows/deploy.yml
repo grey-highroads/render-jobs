@@ -50,6 +50,9 @@ jobs:
           echo "== ensure R2 bucket exists =="
           npx wrangler r2 bucket create higher-roads-renders || echo "(r2 create returned nonzero, assuming it already exists)"
 
+          echo "== ensure queue exists =="
+          npx wrangler queues create render-queue || echo "(queue create returned nonzero, assuming it already exists)"
+
           echo "== apply migrations (remote) =="
           npx wrangler d1 migrations apply render-jobs --remote
 

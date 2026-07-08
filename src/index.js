@@ -62,6 +62,30 @@ export default {
       return json(request, env, 500, { error: 'server_error', message: String(err && err.message || err) });
     }
   },
+
+  // Queue consumer. Runs decoupled from any client request, so the OpenAI
+  // render can take the time it needs. max_batch_size is 1 (see wrangler.jsonc)
+  // so each invocation handles one job.
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      const jobId = message.body && message.body.job_id;
+      if (!jobId) { message.ack(); continue; }
+      try {
+        await renderJobToStorage(jobId, env);
+        message.ack();
+      } catch (err) {
+        const detail = String((err && err.message) || err).slice(0, 300);
+        // max_retries is 2, so attempts 1, 2, 3. On the final attempt, record
+        // the error on the job so the polling client stops waiting, then ack.
+        if (message.attempts >= 3) {
+          try { await markJobError(env, jobId, detail); } catch (_) {}
+          message.ack();
+        } else {
+          message.retry();
+        }
+      }
+    }
+  },
 };
 
 /* -------------------------------------------------------------------------- */
@@ -218,14 +242,14 @@ async function serveAsset(request, env, jobId, name) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* render consumer                                                            */
+/* render: enqueue + consume                                                  */
 /*                                                                            */
-/* Synchronous by design for the proving phase: this handler renders inside   */
-/* the request and returns the completed job. It reuses the proven OpenAI     */
-/* path from the world-preview worker so output matches what was validated.   */
-/* If OpenAI latency ever exceeds the Worker request budget, that is the      */
-/* signal to move rendering onto Cloudflare Queues (a queue consumer worker    */
-/* processing ready_to_render jobs) rather than rendering in the request.     */
+/* The POST /render-jobs/:id/render endpoint enqueues the job and returns      */
+/* immediately with status queued, so it never outlives the client request.   */
+/* The queue consumer (see the queue handler in the default export) calls      */
+/* renderJobToStorage, which runs the proven OpenAI path decoupled from any    */
+/* client connection and writes the output back. The browser polls the job    */
+/* until status is complete or error.                                          */
 /* -------------------------------------------------------------------------- */
 
 async function runRender(request, env, jobId) {
@@ -236,12 +260,13 @@ async function runRender(request, env, jobId) {
   const row = await env.DB.prepare(`SELECT * FROM render_jobs WHERE id = ?`).bind(jobId).first();
   if (!row) return json(request, env, 404, { error: 'job_not_found', job_id: jobId });
 
-  if (row.status === 'rendering' && !force) {
-    return json(request, env, 409, { error: 'already_rendering', job_id: jobId });
-  }
   // Return the existing result rather than re-charging OpenAI, unless forced.
   if (row.status === 'complete' && row.output_image_key && !force) {
     return await getJob(request, env, jobId);
+  }
+  // Already in flight: report status rather than enqueueing a duplicate.
+  if ((row.status === 'queued' || row.status === 'rendering') && !force) {
+    return json(request, env, 202, { job_id: jobId, status: row.status });
   }
   if (!env.OPENAI_API_KEY) {
     return json(request, env, 500, {
@@ -251,59 +276,73 @@ async function runRender(request, env, jobId) {
   }
 
   await env.DB.prepare(
+    `UPDATE render_jobs SET status='queued', error_message=NULL, updated_at=? WHERE id=?`
+  ).bind(nowIso(), jobId).run();
+
+  await env.RENDER_QUEUE.send({ job_id: jobId });
+
+  return json(request, env, 202, { job_id: jobId, status: 'queued' });
+}
+
+// The actual render work, run by the queue consumer. No request context: it
+// stores the output key and lets getJob build the served URL at poll time.
+// Throws on failure so the consumer can retry.
+async function renderJobToStorage(jobId, env) {
+  const nowIso = () => new Date().toISOString();
+  const row = await env.DB.prepare(`SELECT * FROM render_jobs WHERE id = ?`).bind(jobId).first();
+  if (!row) throw new Error('job not found: ' + jobId);
+  if (row.status === 'complete' && row.output_image_key) return; // already done
+
+  if (!env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY secret not set on the worker');
+
+  await env.DB.prepare(
     `UPDATE render_jobs SET status='rendering', error_message=NULL, updated_at=? WHERE id=?`
   ).bind(nowIso(), jobId).run();
 
-  try {
-    const pkgObj = await env.RENDERS.get(row.render_package_key);
-    if (!pkgObj) throw new Error('render package missing in storage');
-    const pkg = JSON.parse(await pkgObj.text());
+  const pkgObj = await env.RENDERS.get(row.render_package_key);
+  if (!pkgObj) throw new Error('render package missing in storage');
+  const pkg = JSON.parse(await pkgObj.text());
 
-    const lockedObj = await env.RENDERS.get(row.locked_product_asset_key);
-    if (!lockedObj) throw new Error('locked product image missing in storage');
-    const lockedBuf = await lockedObj.arrayBuffer();
-    const lockedType = lockedObj.httpMetadata?.contentType || pkg?.locked_asset?.media_type || 'image/png';
-    const productFile = new File(
-      [lockedBuf],
-      'locked-product.' + extensionForMediaType(lockedType),
-      { type: normalizeMediaType(lockedType) }
-    );
+  const lockedObj = await env.RENDERS.get(row.locked_product_asset_key);
+  if (!lockedObj) throw new Error('locked product image missing in storage');
+  const lockedBuf = await lockedObj.arrayBuffer();
+  const lockedType = lockedObj.httpMetadata?.contentType || pkg?.locked_asset?.media_type || 'image/png';
+  const productFile = new File(
+    [lockedBuf],
+    'locked-product.' + extensionForMediaType(lockedType),
+    { type: normalizeMediaType(lockedType) }
+  );
 
-    const prompt = buildOpenAINativePrompt(pkg);
-    const finalImg = await callOpenAIImageEdit(prompt, productFile, env);
+  const prompt = buildOpenAINativePrompt(pkg);
+  const finalImg = await callOpenAIImageEdit(prompt, productFile, env);
 
-    const outMedia = finalImg.media_type || 'image/png';
-    const outputKey = `jobs/${jobId}/output-001.${extensionForMediaType(outMedia)}`;
-    await env.RENDERS.put(outputKey, base64ToBytes(finalImg.image_b64), {
-      httpMetadata: { contentType: outMedia },
-    });
+  const outMedia = finalImg.media_type || 'image/png';
+  const outputKey = `jobs/${jobId}/output-001.${extensionForMediaType(outMedia)}`;
+  await env.RENDERS.put(outputKey, base64ToBytes(finalImg.image_b64), {
+    httpMetadata: { contentType: outMedia },
+  });
 
-    const origin = url.origin;
-    const outputUrl = `${origin}/render-jobs/${jobId}/asset/output`;
-    const meta = {
-      provider: finalImg.provider,
-      model: finalImg.model,
-      requested_size: finalImg.requested_size,
-      requested_quality: finalImg.requested_quality,
-      requested_output_format: finalImg.requested_output_format,
-      prompt_used: prompt,
-    };
+  const meta = {
+    provider: finalImg.provider,
+    model: finalImg.model,
+    requested_size: finalImg.requested_size,
+    requested_quality: finalImg.requested_quality,
+    requested_output_format: finalImg.requested_output_format,
+    prompt_used: prompt,
+  };
 
-    await env.DB.prepare(
-      `UPDATE render_jobs
-         SET status='complete', output_image_key=?, output_image_url=?,
-             render_metadata=?, error_message=NULL, updated_at=?
-       WHERE id=?`
-    ).bind(outputKey, outputUrl, JSON.stringify(meta), nowIso(), jobId).run();
+  await env.DB.prepare(
+    `UPDATE render_jobs
+       SET status='complete', output_image_key=?, output_image_url=NULL,
+           render_metadata=?, error_message=NULL, updated_at=?
+     WHERE id=?`
+  ).bind(outputKey, JSON.stringify(meta), nowIso(), jobId).run();
+}
 
-    return await getJob(request, env, jobId);
-  } catch (e) {
-    const detail = String((e && e.message) || e).slice(0, 300);
-    await env.DB.prepare(
-      `UPDATE render_jobs SET status='error', error_message=?, updated_at=? WHERE id=?`
-    ).bind(detail, nowIso(), jobId).run();
-    return json(request, env, 502, { error: 'render_failed', provider: 'openai', detail, job_id: jobId });
-  }
+async function markJobError(env, jobId, detail) {
+  await env.DB.prepare(
+    `UPDATE render_jobs SET status='error', error_message=?, updated_at=? WHERE id=?`
+  ).bind(String(detail || 'render failed').slice(0, 300), new Date().toISOString(), jobId).run();
 }
 
 /* -------------------------------------------------------------------------- */

@@ -1,10 +1,15 @@
 # render-jobs worker
 
-The render job service: package delivery plus synchronous render execution. The preview
+The render job service: package delivery plus asynchronous render execution. The preview
 app creates jobs here. Assets go to R2 and are referenced by key. Job records live in D1.
-The render endpoint runs the OpenAI consumer inline: it reads a ready job, renders against
-the locked image, writes the output back to R2, and marks the job complete. A job sits at
-`ready_to_render` between creation and the render call. ComfyUI remains a future backend.
+The render endpoint enqueues the job on a Cloudflare Queue and returns immediately with
+status `queued`. A queue consumer in this same worker runs the OpenAI render off the request
+path, writes the output to R2, and flips the job to `complete` or `error`. The client polls
+the job until it resolves. Status flow: `ready_to_render` then `queued` then `rendering`
+then `complete` or `error`. ComfyUI remains a future backend.
+
+Note: Cloudflare Queues requires the Workers Paid plan. A deploy that fails at the queue
+step on a plan or billing error means the account needs Queues enabled.
 
 This is a standalone worker. It does not touch the existing `world-preview` worker.
 
@@ -95,18 +100,21 @@ GET /render-jobs/:id
 GET /render-jobs/:id/asset/:name        name in { locked | output | package }
   -> streams the asset from R2 with its content type
 
-POST /render-jobs/:id/render          renders the job with OpenAI, writes output to R2,
-                                      flips status to complete, returns the job record.
-                                      Synchronous: the render happens inside the request.
-                                      ?force=1 re-renders a complete job (re-charges OpenAI).
-  -> 200 job record | 409 already_rendering | 500 openai_key_missing | 502 render_failed
+POST /render-jobs/:id/render          enqueues the job for rendering, returns immediately.
+                                      The queue consumer does the OpenAI render off the
+                                      request path. Poll GET /render-jobs/:id until status
+                                      is complete or error. ?force=1 re-renders a complete
+                                      job (re-charges OpenAI).
+  -> 202 { job_id, status:'queued' } | 500 openai_key_missing
+  (a complete job with ?force absent returns the existing 200 job record)
 ```
 
-## Rendering (OpenAI)
+## Rendering (OpenAI, async via Queues)
 
 The render path is ported from the proven world-preview worker, so output matches what was
 already validated: the locked product image is passed as the edit input, and clear-space
-language is stripped so the model does not draw placeholder boxes.
+language is stripped so the model does not draw placeholder boxes. It runs on a queue
+consumer, decoupled from the client request, so a slow render never times out the caller.
 
 One-time secret: add `OPENAI_API_KEY` as a secret on the render-jobs worker. Easiest is the
 dashboard: Workers & Pages > render-jobs > Settings > Variables and Secrets > add a Secret
@@ -117,8 +125,9 @@ Tunable, non-secret vars live in `wrangler.jsonc`: `OPENAI_IMAGE_MODEL`, `OPENAI
 For landscape previews, set `OPENAI_IMAGE_SIZE` to a landscape size the current image model
 supports (verify against OpenAI docs or Jim's tests rather than assuming a value).
 
-Synchronous by design for now. If OpenAI latency exceeds the Worker request budget, that is
-the trigger to move rendering onto Cloudflare Queues rather than rendering in the request.
+Failure handling: the consumer retries a job up to `max_retries` (2) times on transient
+OpenAI errors. On the final failed attempt it records the message on the job as `error` so
+the polling client stops waiting.
 
 ## Base64 policy
 

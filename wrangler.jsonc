@@ -41,6 +41,19 @@
     "OPENAI_IMAGE_OUTPUT_FORMAT": "png"
   },
 
+  // Async render pipeline. The fetch handler produces to render-queue; the
+  // queue handler in the same worker consumes it. max_batch_size 1 keeps each
+  // heavy OpenAI render in its own invocation. max_retries 2 gives transient
+  // OpenAI failures a couple of attempts before the job is marked error.
+  "queues": {
+    "producers": [
+      { "queue": "render-queue", "binding": "RENDER_QUEUE" }
+    ],
+    "consumers": [
+      { "queue": "render-queue", "max_batch_size": 1, "max_batch_timeout": 5, "max_retries": 2 }
+    ]
+  },
+
   "observability": {
     "enabled": true
   }
