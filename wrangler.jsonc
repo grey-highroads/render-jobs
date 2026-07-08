@@ -5,6 +5,10 @@
   "compatibility_date": "2026-07-07",
   "workers_dev": true,
 
+  // Pinned so wrangler does not call /memberships to resolve the account.
+  // A user API token cannot read memberships, which blocks every command.
+  "account_id": "4fe56b3b11951a260d67361df9b864a0",
+
   // D1 holds job records. Fill database_id after `wrangler d1 create render-jobs`.
   "d1_databases": [
     {
