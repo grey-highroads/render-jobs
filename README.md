@@ -94,9 +94,30 @@ GET /render-jobs/:id
 GET /render-jobs/:id/asset/:name        name in { locked | output | package }
   -> streams the asset from R2 with its content type
 
-POST /render-jobs/:id/render
-  -> 501 for now. This is the seam where the renderer consumer lands next.
+POST /render-jobs/:id/render          renders the job with OpenAI, writes output to R2,
+                                      flips status to complete, returns the job record.
+                                      Synchronous: the render happens inside the request.
+                                      ?force=1 re-renders a complete job (re-charges OpenAI).
+  -> 200 job record | 409 already_rendering | 500 openai_key_missing | 502 render_failed
 ```
+
+## Rendering (OpenAI)
+
+The render path is ported from the proven world-preview worker, so output matches what was
+already validated: the locked product image is passed as the edit input, and clear-space
+language is stripped so the model does not draw placeholder boxes.
+
+One-time secret: add `OPENAI_API_KEY` as a secret on the render-jobs worker. Easiest is the
+dashboard: Workers & Pages > render-jobs > Settings > Variables and Secrets > add a Secret
+named `OPENAI_API_KEY`. Secrets persist across deploys, so this is a one-time step.
+
+Tunable, non-secret vars live in `wrangler.jsonc`: `OPENAI_IMAGE_MODEL`, `OPENAI_IMAGE_SIZE`,
+`OPENAI_IMAGE_QUALITY`, `OPENAI_IMAGE_OUTPUT_FORMAT`. Defaults match the proven function.
+For landscape previews, set `OPENAI_IMAGE_SIZE` to a landscape size the current image model
+supports (verify against OpenAI docs or Jim's tests rather than assuming a value).
+
+Synchronous by design for now. If OpenAI latency exceeds the Worker request budget, that is
+the trigger to move rendering onto Cloudflare Queues rather than rendering in the request.
 
 ## Base64 policy
 

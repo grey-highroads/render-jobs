@@ -30,7 +30,11 @@
   // During the proving phase this is convenience, not security. Real auth,
   // rate limiting, and cost ceilings are deferred to the GA hardening phase.
   "vars": {
-    "ALLOWED_ORIGINS": "https://higher-roads.com,https://www.higher-roads.com"
+    "ALLOWED_ORIGINS": "https://higher-roads.com,https://www.higher-roads.com",
+    "OPENAI_IMAGE_MODEL": "gpt-image-2",
+    "OPENAI_IMAGE_SIZE": "1024x1024",
+    "OPENAI_IMAGE_QUALITY": "medium",
+    "OPENAI_IMAGE_OUTPUT_FORMAT": "png"
   },
 
   "observability": {

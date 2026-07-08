@@ -50,13 +50,9 @@ export default {
         return await serveAsset(request, env, parts[1], parts[3]);
       }
 
-      // POST /render-jobs/:id/render  (stub)
+      // POST /render-jobs/:id/render
       if (request.method === 'POST' && parts.length === 3 && parts[0] === 'render-jobs' && parts[2] === 'render') {
-        return json(request, env, 501, {
-          error: 'renderer_not_wired',
-          message: 'The render consumer is the next build slice. This job is stored and ready_to_render.',
-          job_id: parts[1],
-        });
+        return await runRender(request, env, parts[1]);
       }
 
       return json(request, env, 404, { error: 'not_found' });
@@ -217,6 +213,214 @@ async function serveAsset(request, env, jobId, name) {
   headers.set('Content-Type', object.httpMetadata?.contentType || 'application/octet-stream');
   headers.set('Cache-Control', 'private, max-age=300');
   return new Response(object.body, { status: 200, headers });
+}
+
+/* -------------------------------------------------------------------------- */
+/* render consumer                                                            */
+/*                                                                            */
+/* Synchronous by design for the proving phase: this handler renders inside   */
+/* the request and returns the completed job. It reuses the proven OpenAI     */
+/* path from the world-preview worker so output matches what was validated.   */
+/* If OpenAI latency ever exceeds the Worker request budget, that is the      */
+/* signal to move rendering onto Cloudflare Queues (a queue consumer worker    */
+/* processing ready_to_render jobs) rather than rendering in the request.     */
+/* -------------------------------------------------------------------------- */
+
+async function runRender(request, env, jobId) {
+  const url = new URL(request.url);
+  const force = url.searchParams.get('force') === '1';
+  const nowIso = () => new Date().toISOString();
+
+  const row = await env.DB.prepare(`SELECT * FROM render_jobs WHERE id = ?`).bind(jobId).first();
+  if (!row) return json(request, env, 404, { error: 'job_not_found', job_id: jobId });
+
+  if (row.status === 'rendering' && !force) {
+    return json(request, env, 409, { error: 'already_rendering', job_id: jobId });
+  }
+  // Return the existing result rather than re-charging OpenAI, unless forced.
+  if (row.status === 'complete' && row.output_image_key && !force) {
+    return await getJob(request, env, jobId);
+  }
+  if (!env.OPENAI_API_KEY) {
+    return json(request, env, 500, {
+      error: 'openai_key_missing',
+      message: 'Set OPENAI_API_KEY as a secret on the render-jobs worker.',
+    });
+  }
+
+  await env.DB.prepare(
+    `UPDATE render_jobs SET status='rendering', error_message=NULL, updated_at=? WHERE id=?`
+  ).bind(nowIso(), jobId).run();
+
+  try {
+    const pkgObj = await env.RENDERS.get(row.render_package_key);
+    if (!pkgObj) throw new Error('render package missing in storage');
+    const pkg = JSON.parse(await pkgObj.text());
+
+    const lockedObj = await env.RENDERS.get(row.locked_product_asset_key);
+    if (!lockedObj) throw new Error('locked product image missing in storage');
+    const lockedBuf = await lockedObj.arrayBuffer();
+    const lockedType = lockedObj.httpMetadata?.contentType || pkg?.locked_asset?.media_type || 'image/png';
+    const productFile = new File(
+      [lockedBuf],
+      'locked-product.' + extensionForMediaType(lockedType),
+      { type: normalizeMediaType(lockedType) }
+    );
+
+    const prompt = buildOpenAINativePrompt(pkg);
+    const finalImg = await callOpenAIImageEdit(prompt, productFile, env);
+
+    const outMedia = finalImg.media_type || 'image/png';
+    const outputKey = `jobs/${jobId}/output-001.${extensionForMediaType(outMedia)}`;
+    await env.RENDERS.put(outputKey, base64ToBytes(finalImg.image_b64), {
+      httpMetadata: { contentType: outMedia },
+    });
+
+    const origin = url.origin;
+    const outputUrl = `${origin}/render-jobs/${jobId}/asset/output`;
+    const meta = {
+      provider: finalImg.provider,
+      model: finalImg.model,
+      requested_size: finalImg.requested_size,
+      requested_quality: finalImg.requested_quality,
+      requested_output_format: finalImg.requested_output_format,
+      prompt_used: prompt,
+    };
+
+    await env.DB.prepare(
+      `UPDATE render_jobs
+         SET status='complete', output_image_key=?, output_image_url=?,
+             render_metadata=?, error_message=NULL, updated_at=?
+       WHERE id=?`
+    ).bind(outputKey, outputUrl, JSON.stringify(meta), nowIso(), jobId).run();
+
+    return await getJob(request, env, jobId);
+  } catch (e) {
+    const detail = String((e && e.message) || e).slice(0, 300);
+    await env.DB.prepare(
+      `UPDATE render_jobs SET status='error', error_message=?, updated_at=? WHERE id=?`
+    ).bind(detail, nowIso(), jobId).run();
+    return json(request, env, 502, { error: 'render_failed', provider: 'openai', detail, job_id: jobId });
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* OpenAI renderer (ported verbatim from the proven world-preview worker,     */
+/* except normalizeMediaType, which was not in the shared snippet and is      */
+/* reconstructed here as a trivial normalizer. Verify if behavior matters.)   */
+/* -------------------------------------------------------------------------- */
+
+// [RECONSTRUCTED] normalizeMediaType was referenced but not included in the
+// shared render function. This is a minimal stand-in, not the original.
+function normalizeMediaType(mt) {
+  const m = String(mt || '').toLowerCase().trim();
+  if (!m) return 'image/png';
+  if (m === 'image/jpg') return 'image/jpeg';
+  return m;
+}
+
+function extensionForMediaType(mt) {
+  const m = normalizeMediaType(mt).toLowerCase();
+  if (m.includes('webp')) return 'webp';
+  if (m.includes('jpeg') || m.includes('jpg')) return 'jpg';
+  return 'png';
+}
+
+function cleanWorldPromptForNativeComposite(prompt) {
+  return String(prompt || '')
+    .replace(/leave clear space for the product\.?/ig, '')
+    .replace(/leave clear space\.?/ig, '')
+    .replace(/leave room for the product\.?/ig, '')
+    .replace(/clear space for the product\.?/ig, '')
+    .replace(/clear placement area\.?/ig, '')
+    .replace(/empty product zone\.?/ig, '')
+    .replace(/product-shaped placement area\.?/ig, '')
+    .replace(/placement area\.?/ig, '')
+    .replace(/do not draw any product,?\s*/ig, '')
+    .replace(/do not draw[^.]*\b(product|can|bottle|package|label|logo|brand name|readable text)[^.]*\./ig, '')
+    .replace(/without any product,?\s*/ig, '')
+    .replace(/no product,?\s*/ig, '')
+    .replace(/no can,?\s*/ig, '')
+    .replace(/no bottle,?\s*/ig, '')
+    .replace(/no package,?\s*/ig, '')
+    .replace(/no label,?\s*/ig, '')
+    .replace(/no logo,?\s*/ig, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildOpenAINativePrompt(requestJson) {
+  const variants = Array.isArray(requestJson && requestJson.variants) ? requestJson.variants : [];
+  const reference = variants.find((v) => v.render_path === 'reference') || {};
+  const composite = variants.find((v) => v.render_path === 'composite') || variants[0] || {};
+
+  const world = cleanWorldPromptForNativeComposite(
+    composite.positive || reference.positive || requestJson?.prompts?.positive || ''
+  );
+
+  const fidelity = requestJson?.fidelity_contract?.rules || [];
+  const product =
+    requestJson?.meta?.product_name || requestJson?.locked_asset?.asset_name || 'the supplied product';
+
+  return [
+    'Create one finished premium product-world photograph.',
+    'Use the uploaded product image as the exact hero product asset: ' + product + '.',
+    'Place the supplied product naturally on the surface in the foreground.',
+    'The product should feel photographed in the scene, not pasted on top.',
+    'Match the scene light direction, shadow softness, lens perspective, reflections, surface contact, and ambient color spill.',
+    'Add believable contact shadow under the product.',
+    'Do not redraw, retype, recolor, redesign, relabel, reshape, crop, or reinterpret the product packaging.',
+    'The label hierarchy, text, logo, can shape, proportions, and colors must remain visually unchanged from the supplied image.',
+    'Do not create placeholder boxes, dashed outlines, product placement guides, crop marks, empty product zones, layout frames, labels, signage, QR codes, extra cans, hands, or people.',
+    world ? 'Scene direction: ' + world : '',
+    fidelity.length ? 'Fidelity rules: ' + fidelity.join(' ') : '',
+  ].filter(Boolean).join('\n');
+}
+
+async function callOpenAIImageEdit(prompt, productFile, env) {
+  const key = env && env.OPENAI_API_KEY;
+  if (!key) throw new Error('OPENAI_API_KEY secret not set on the Worker');
+
+  const model = (env && env.OPENAI_IMAGE_MODEL) || 'gpt-image-2';
+  const size = (env && env.OPENAI_IMAGE_SIZE) || '1024x1024';
+  const quality = (env && env.OPENAI_IMAGE_QUALITY) || 'medium';
+  const outputFormat = (env && env.OPENAI_IMAGE_OUTPUT_FORMAT) || 'png';
+
+  const fd = new FormData();
+  fd.append('model', model);
+  fd.append('prompt', prompt);
+  fd.append('size', size);
+  fd.append('quality', quality);
+  fd.append('output_format', outputFormat);
+  fd.append('image[]', productFile, productFile.name || ('locked-product.' + extensionForMediaType(productFile.type)));
+
+  const res = await fetch('https://api.openai.com/v1/images/edits', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + key },
+    body: fd,
+  });
+
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+  if (!res.ok) {
+    const detail = data?.error?.message || text || ('OpenAI image edit ' + res.status);
+    throw new Error(detail.slice(0, 300));
+  }
+
+  const b64 = data?.data?.[0]?.b64_json;
+  if (!b64) throw new Error('OpenAI returned no b64_json image');
+
+  return {
+    image_b64: b64,
+    media_type: 'image/' + outputFormat,
+    model,
+    provider: 'openai',
+    requested_size: size,
+    requested_quality: quality,
+    requested_output_format: outputFormat,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
