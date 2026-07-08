@@ -1,0 +1,56 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Require Cloudflare token
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "CLOUDFLARE_API_TOKEN secret is not set."
+            echo "Add it under Settings > Secrets and variables > Actions, then re-run this workflow."
+            exit 1
+          fi
+
+      - name: Install wrangler
+        run: npm install
+
+      - name: Provision and deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "== ensure D1 database exists =="
+          npx wrangler d1 create render-jobs || echo "(d1 create returned nonzero, assuming it already exists)"
+
+          echo "== resolve database id =="
+          DB_ID="$(npx wrangler d1 list --json | node scripts/extract-d1-id.mjs render-jobs)"
+          echo "resolved database_id: ${DB_ID}"
+          test -n "${DB_ID}"
+
+          echo "== inject database id into wrangler.jsonc =="
+          sed -i "s/REPLACE_AFTER_D1_CREATE/${DB_ID}/" wrangler.jsonc
+          grep -q "${DB_ID}" wrangler.jsonc
+
+          echo "== ensure R2 bucket exists =="
+          npx wrangler r2 bucket create higher-roads-renders || echo "(r2 create returned nonzero, assuming it already exists)"
+
+          echo "== apply migrations (remote) =="
+          npx wrangler d1 migrations apply render-jobs --remote
+
+          echo "== deploy =="
+          npx wrangler deploy

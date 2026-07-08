@@ -1,0 +1,14 @@
+{
+  "name": "render-jobs",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Render job service worker for Higher Roads Product World Preview",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "migrate": "wrangler d1 migrations apply render-jobs --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

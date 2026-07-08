@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "render-jobs",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-07",
+  "workers_dev": true,
+
+  // D1 holds job records. Fill database_id after `wrangler d1 create render-jobs`.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "render-jobs",
+      "database_id": "REPLACE_AFTER_D1_CREATE"
+    }
+  ],
+
+  // R2 holds job assets: render-package.json, locked-product image, outputs.
+  "r2_buckets": [
+    {
+      "binding": "RENDERS",
+      "bucket_name": "higher-roads-renders"
+    }
+  ],
+
+  // Origins allowed to call this worker from the browser. Comma separated.
+  // During the proving phase this is convenience, not security. Real auth,
+  // rate limiting, and cost ceilings are deferred to the GA hardening phase.
+  "vars": {
+    "ALLOWED_ORIGINS": "https://higher-roads.com,https://www.higher-roads.com"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}
