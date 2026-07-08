@@ -403,10 +403,12 @@ function buildOpenAINativePrompt(requestJson) {
   const product =
     requestJson?.meta?.product_name || requestJson?.locked_asset?.asset_name || 'the supplied product';
 
+  const placement = placementProse(requestJson?.placement_spec);
+
   return [
-    'Create one finished premium product-world photograph.',
+    'Create one finished premium cinematic brand-world photograph, wide 16:9.',
     'Use the uploaded product image as the exact hero product asset: ' + product + '.',
-    'Place the supplied product naturally on the surface in the foreground.',
+    placement,
     'The product should feel photographed in the scene, not pasted on top.',
     'Match the scene light direction, shadow softness, lens perspective, reflections, surface contact, and ambient color spill.',
     'Add believable contact shadow under the product.',
@@ -415,7 +417,22 @@ function buildOpenAINativePrompt(requestJson) {
     'Do not create placeholder boxes, dashed outlines, product placement guides, crop marks, empty product zones, layout frames, labels, signage, QR codes, extra cans, hands, or people.',
     world ? 'Scene direction: ' + world : '',
     fidelity.length ? 'Fidelity rules: ' + fidelity.join(' ') : '',
-  ].filter(Boolean).join('\n');
+  ].filter(Boolean).join('\n').replace(/(?:^|\s)0\.(?=\s|$)/g, ' ');
+}
+
+// One authoritative placement instruction, derived from the numeric spec so the
+// words and the numbers never disagree. The verbal position comes from cx.
+function placementProse(spec) {
+  spec = spec || {};
+  const cx = typeof spec.cx === 'number' ? spec.cx : 0.62;
+  const cy = typeof spec.cy === 'number' ? spec.cy : 0.6;
+  const w = typeof spec.width_pct === 'number' ? spec.width_pct : 0.24;
+  const third = cx <= 0.42 ? 'left third' : (cx >= 0.58 ? 'right third' : 'center');
+  const vert = cy >= 0.66 ? 'lower portion' : 'lower-middle';
+  const pct = Math.round(w * 100);
+  return 'Place the product in the ' + third + ' of the frame, ' + vert +
+    ', upright and label facing camera, occupying about ' + pct +
+    ' percent of the frame width, as a small but clear hero within the world, not centered and not filling the frame. Keep enough surrounding environment visible to read the world.';
 }
 
 async function callOpenAIImageEdit(prompt, productFile, env) {
