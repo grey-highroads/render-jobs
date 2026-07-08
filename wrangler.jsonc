@@ -9,7 +9,11 @@
   // A user API token cannot read memberships, which blocks every command.
   "account_id": "4fe56b3b11951a260d67361df9b864a0",
 
-  // D1 holds job records. Fill database_id after `wrangler d1 create render-jobs`.
+  // D1 holds job records. The placeholder below is intentional and repo-safe:
+  // CI resolves the real database_id at deploy time (d1 list --json, parsed by
+  // scripts/extract-d1-id.mjs) and injects it here before `wrangler deploy`, so
+  // the deployed worker binds the real database. A manual `wrangler deploy`
+  // straight from the repo needs the real id pasted in first (see README).
   "d1_databases": [
     {
       "binding": "DB",

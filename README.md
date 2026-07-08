@@ -1,9 +1,10 @@
 # render-jobs worker
 
-The render job service. The preview app creates jobs here. Assets go to R2 and are
-referenced by key. Job records live in D1. Renderer consumers read a ready job, render,
-and write the output back. That consumer is the next slice and is not wired yet, so a new
-job sits at `ready_to_render` after creation. That is the expected state for this phase.
+The render job service: package delivery plus synchronous render execution. The preview
+app creates jobs here. Assets go to R2 and are referenced by key. Job records live in D1.
+The render endpoint runs the OpenAI consumer inline: it reads a ready job, renders against
+the locked image, writes the output back to R2, and marks the job complete. A job sits at
+`ready_to_render` between creation and the render call. ComfyUI remains a future backend.
 
 This is a standalone worker. It does not touch the existing `world-preview` worker.
 

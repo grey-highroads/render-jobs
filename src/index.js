@@ -1,16 +1,18 @@
 /**
  * render-jobs worker
  *
- * A small render job service. The preview app creates jobs here. Assets are
- * written to R2 and referenced by key. Job records live in D1. Renderer
- * consumers (OpenAI, ComfyUI) read a ready job, render, and write the output
- * back to the same job. That consumer is the next slice and is not wired yet.
+ * A render job service: package delivery plus synchronous render execution.
+ * The preview app creates jobs here. Assets are written to R2 and referenced
+ * by key. Job records live in D1. The render endpoint runs the OpenAI consumer
+ * inline: it reads a ready job, renders against the locked image, writes the
+ * output back to R2, and marks the job complete. ComfyUI remains a future
+ * backend that would consume ready jobs the same way.
  *
  * Routes:
  *   POST /render-jobs                       create a job, store assets, return job_id
  *   GET  /render-jobs/:id                    return the job record + served asset urls
  *   GET  /render-jobs/:id/asset/:name        stream an asset from R2 (locked | output | package)
- *   POST /render-jobs/:id/render             STUB. renderer not wired yet, returns 501.
+ *   POST /render-jobs/:id/render             render with OpenAI, store output, mark complete
  *
  * Bindings (see wrangler.jsonc):
  *   DB       D1 database, render_jobs table
